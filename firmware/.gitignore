@@ -1,0 +1,19 @@
+.pio/
+.vscode/
+.idea/
+*.pyc
+__pycache__/
+.DS_Store
+Thumbs.db
+
+# Local env/credentials
+.env
+.env.*
+
+# Build artifacts
+*.bin
+*.elf
+*.hex
+*.map
+*.mt.json
+*.uf2
