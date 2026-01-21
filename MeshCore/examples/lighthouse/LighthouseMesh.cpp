@@ -99,6 +99,12 @@ void LighthouseMesh::setHelpBotClient(HelpBotClient *client) {
   _help_bot_client = client;
 }
 
+void LighthouseMesh::setHelpBotUrl(const char *url) {
+  if (_help_bot_client) {
+    _help_bot_client->setUrl(url);
+  }
+}
+
 void LighthouseMesh::loop() {
   mesh::Mesh::loop();
   updateAnnouncement();
@@ -767,6 +773,44 @@ bool LighthouseMesh::handleHelpMessage(const char *text) {
   }
   const char *type = strtok_r(nullptr, "|", &saveptr);
   if (!type) {
+    return true;
+  }
+
+  if (strcmp(type, "PING") == 0) {
+    const char *ping_id = strtok_r(nullptr, "|", &saveptr);
+    if (!ping_id) {
+      return true;
+    }
+    uint32_t timestamp = getRTCClock()->getCurrentTime();
+    char message[96];
+    snprintf(message, sizeof(message), "HELP|PONG|%s|%d|%lu",
+             ping_id, LIGHTHOUSE_NUMBER, (unsigned long)timestamp);
+    sendHelpBroadcast(message);
+    char ack_key[40];
+    snprintf(ack_key, sizeof(ack_key), "PONG|%s|%d", ping_id, LIGHTHOUSE_NUMBER);
+    if (!isAcked(ack_key) && _help_bot_client && _help_bot_client->isEnabled()) {
+      rememberAck(ack_key);
+      if (_help_bot_client->postMeshEvent(message, _node_name)) {
+        Serial.printf("Help relay: forwarded PONG %s\n", ack_key);
+      }
+    }
+    return true;
+  }
+
+  if (strcmp(type, "PONG") == 0) {
+    const char *ping_id = strtok_r(nullptr, "|", &saveptr);
+    const char *lh_str = strtok_r(nullptr, "|", &saveptr);
+    if (!ping_id || !lh_str) {
+      return true;
+    }
+    char ack_key[40];
+    snprintf(ack_key, sizeof(ack_key), "PONG|%s|%s", ping_id, lh_str);
+    if (!isAcked(ack_key) && _help_bot_client && _help_bot_client->isEnabled()) {
+      rememberAck(ack_key);
+      if (_help_bot_client->postMeshEvent(payload, _node_name)) {
+        Serial.printf("Help relay: forwarded PONG %s\n", ack_key);
+      }
+    }
     return true;
   }
 

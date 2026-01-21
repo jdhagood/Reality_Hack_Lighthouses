@@ -70,6 +70,7 @@ public:
   void setAudioStreamer(class AudioStreamer *streamer);
   void setDiscordServer(class DiscordServer *server);
   void setHelpBotClient(class HelpBotClient *client);
+  void setHelpBotUrl(const char *url);
   void loop();
   bool sendButtonPressMessage();
   bool requestHelp(const char *color_name);
@@ -181,7 +182,7 @@ private:
   void startMailboxAlert();
   void stopMailbox();
 
-  static const uint8_t kAckCacheSize = 16;
+  static const uint8_t kAckCacheSize = 64;
   char _ack_cache[kAckCacheSize][40];
   uint8_t _ack_cache_head;
 

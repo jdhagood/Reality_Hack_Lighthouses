@@ -62,6 +62,7 @@ class HelpRequest:
     lighthouse: int
     status: str
     message_id: int
+    channel_id: int
     color: Optional[str] = None
     claimed_by: Optional[int] = None
     reason: Optional[str] = None
@@ -117,11 +118,25 @@ def parse_help_message(text: str) -> Optional[Dict[str, str]]:
         data["lighthouse"] = parts[3]
         data["user_id"] = parts[4]
         return data
+    if msg_type == "PONG" and len(parts) >= 5:
+        data["ping_id"] = parts[2]
+        data["lighthouse"] = parts[3]
+        data["timestamp"] = parts[4]
+        return data
     return None
 
 
 class HelpRequestView(discord.ui.View):
-    def __init__(self, manager: "HelpQueueManager", req_id: str, status: str, claimed_by: Optional[int]):
+    def __init__(
+        self,
+        manager: "HelpQueueManager",
+        req_id: str,
+        status: str,
+        claimed_by: Optional[int],
+        show_details: bool = True,
+        show_claim: bool = True,
+        show_resolve: bool = True,
+    ):
         super().__init__(timeout=None)
         self.manager = manager
         self.req_id = req_id
@@ -130,41 +145,47 @@ class HelpRequestView(discord.ui.View):
         claim_disabled = status != "open"
         resolve_disabled = status != "claimed"
 
-        details_button = discord.ui.Button(
-            label="Add Details",
-            style=discord.ButtonStyle.secondary,
-            custom_id=f"help_details:{req_id}",
-            disabled=details_disabled,
-        )
-        claim_button = discord.ui.Button(
-            label="Claim",
-            style=discord.ButtonStyle.primary,
-            custom_id=f"help_claim:{req_id}",
-            disabled=claim_disabled,
-        )
-        resolve_button = discord.ui.Button(
-            label="Resolve",
-            style=discord.ButtonStyle.success,
-            custom_id=f"help_resolve:{req_id}",
-            disabled=resolve_disabled,
-        )
+        if show_details:
+            details_button = discord.ui.Button(
+                label="Add Details",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"help_details:{req_id}",
+                disabled=details_disabled,
+            )
 
-        async def on_details(interaction: discord.Interaction) -> None:
-            await interaction.response.send_modal(HelpDetailsModal(self.manager, self.req_id))
+            async def on_details(interaction: discord.Interaction) -> None:
+                await interaction.response.send_modal(HelpDetailsModal(self.manager, self.req_id))
 
-        async def on_claim(interaction: discord.Interaction) -> None:
-            await self.manager.handle_claim(interaction, self.req_id)
+            details_button.callback = on_details
+            self.add_item(details_button)
 
-        async def on_resolve(interaction: discord.Interaction) -> None:
-            await self.manager.handle_resolve(interaction, self.req_id)
+        if show_claim:
+            claim_button = discord.ui.Button(
+                label="Claim",
+                style=discord.ButtonStyle.primary,
+                custom_id=f"help_claim:{req_id}",
+                disabled=claim_disabled,
+            )
 
-        details_button.callback = on_details
-        claim_button.callback = on_claim
-        resolve_button.callback = on_resolve
+            async def on_claim(interaction: discord.Interaction) -> None:
+                await self.manager.handle_claim(interaction, self.req_id)
 
-        self.add_item(details_button)
-        self.add_item(claim_button)
-        self.add_item(resolve_button)
+            claim_button.callback = on_claim
+            self.add_item(claim_button)
+
+        if show_resolve:
+            resolve_button = discord.ui.Button(
+                label="Resolve",
+                style=discord.ButtonStyle.success,
+                custom_id=f"help_resolve:{req_id}",
+                disabled=resolve_disabled,
+            )
+
+            async def on_resolve(interaction: discord.Interaction) -> None:
+                await self.manager.handle_resolve(interaction, self.req_id)
+
+            resolve_button.callback = on_resolve
+            self.add_item(resolve_button)
 
 
 class HelpQueueManager:
@@ -172,16 +193,66 @@ class HelpQueueManager:
         self.client = client
         self.requests: Dict[str, HelpRequest] = {}
         self.channel: Optional[discord.TextChannel] = None
+        self.lighthouse_channels: Dict[int, discord.TextChannel] = {}
         self.gateway_ip: Optional[str] = None
         self.views: Dict[str, HelpRequestView] = {}
+        self.ping_waiters: Dict[str, set[int]] = {}
 
     async def init_channel(self) -> None:
         for guild in self.client.guilds:
-            for channel in guild.text_channels:
-                if channel.name == CHANNEL_NAME:
-                    self.channel = channel
-                    return
+            channel = discord.utils.get(guild.text_channels, name=CHANNEL_NAME)
+            if channel is None:
+                overwrites = self._admin_only_overwrites(guild)
+                channel = await guild.create_text_channel(CHANNEL_NAME, overwrites=overwrites)
+            else:
+                await channel.edit(overwrites=self._admin_only_overwrites(guild))
+            self.channel = channel
+
+            for lh_id in range(1, 31):
+                name = f"lh-{lh_id:02d}"
+                role_name = f"Team-{lh_id:02d}"
+                team_role = discord.utils.get(guild.roles, name=role_name)
+                if team_role is None:
+                    team_role = await guild.create_role(name=role_name, mentionable=True)
+                overwrites = self._team_channel_overwrites(guild, team_role)
+                lh_channel = discord.utils.get(guild.text_channels, name=name)
+                if lh_channel is None:
+                    lh_channel = await guild.create_text_channel(name, overwrites=overwrites)
+                else:
+                    await lh_channel.edit(overwrites=overwrites)
+                self.lighthouse_channels[lh_id] = lh_channel
+            return
         raise RuntimeError(f"Channel named '{CHANNEL_NAME}' not found.")
+
+    @staticmethod
+    def _admin_only_overwrites(guild: discord.Guild) -> Dict[discord.abc.Snowflake, discord.PermissionOverwrite]:
+        overwrites: Dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False)
+        }
+        for role in guild.roles:
+            if role.permissions.administrator:
+                overwrites[role] = discord.PermissionOverwrite(view_channel=True)
+        return overwrites
+
+    @classmethod
+    def _team_channel_overwrites(
+        cls,
+        guild: discord.Guild,
+        team_role: discord.Role,
+    ) -> Dict[discord.abc.Snowflake, discord.PermissionOverwrite]:
+        overwrites = cls._admin_only_overwrites(guild)
+        overwrites[team_role] = discord.PermissionOverwrite(view_channel=True)
+        return overwrites
+
+    async def get_lighthouse_channel(self, lighthouse: int) -> discord.TextChannel:
+        channel = self.lighthouse_channels.get(lighthouse)
+        if channel:
+            return channel
+        await self.init_channel()
+        channel = self.lighthouse_channels.get(lighthouse)
+        if not channel:
+            raise RuntimeError(f"Channel for lighthouse {lighthouse} not found.")
+        return channel
 
     async def post_to_gateways(self, text: str) -> None:
         urls = list(GATEWAY_URLS)
@@ -224,14 +295,23 @@ class HelpQueueManager:
             return HandleResult(handled=False, deduped=False)
 
         msg_type = parsed["type"]
+        if msg_type == "PONG":
+            ping_id = parsed.get("ping_id")
+            lighthouse = int(parsed["lighthouse"])
+            waiter = self.ping_waiters.get(ping_id)
+            if waiter is None:
+                return HandleResult(handled=True, deduped=True)
+            already = lighthouse in waiter
+            waiter.add(lighthouse)
+            return HandleResult(handled=True, deduped=already)
+
         req_id = parsed["req_id"]
         lighthouse = int(parsed["lighthouse"])
 
         if msg_type == "REQ":
             if req_id in self.requests:
                 return HandleResult(handled=True, deduped=True)
-            if not self.channel:
-                await self.init_channel()
+            channel = await self.get_lighthouse_channel(lighthouse)
             color = parsed.get("color")
             color_line = f"\nColor: {color}" if color else ""
             content = (
@@ -240,14 +320,15 @@ class HelpQueueManager:
                 f"{color_line}\n"
                 "Status: Waiting for details."
             )
-            view = HelpRequestView(self, req_id, "pending", None)
-            message = await self.channel.send(content, view=view)
+            view = HelpRequestView(self, req_id, "pending", None, show_claim=False, show_resolve=False)
+            message = await channel.send(content, view=view)
             self.views[req_id] = view
             self.requests[req_id] = HelpRequest(
                 req_id=req_id,
                 lighthouse=lighthouse,
                 status="pending",
                 message_id=message.id,
+                channel_id=channel.id,
                 color=color,
             )
             return HandleResult(handled=True, deduped=False)
@@ -265,10 +346,17 @@ class HelpQueueManager:
         return HandleResult(handled=True, deduped=True)
 
     async def update_message(self, req: HelpRequest, status_line: str) -> None:
-        if not self.channel:
+        channel = self.channel
+        if not channel:
             await self.init_channel()
+            channel = self.channel
         try:
-            message = await self.channel.fetch_message(req.message_id)
+            channel_obj = self.client.get_channel(req.channel_id)
+            if not isinstance(channel_obj, discord.TextChannel):
+                channel_obj = channel
+            if channel_obj is None:
+                return
+            message = await channel_obj.fetch_message(req.message_id)
         except discord.NotFound:
             return
         color_line = f"\nColor: {req.color}" if req.color else ""
@@ -280,7 +368,7 @@ class HelpQueueManager:
             f"{reason_line}\n"
             f"Status: {status_line}"
         )
-        view = HelpRequestView(self, req.req_id, req.status, req.claimed_by)
+        view = HelpRequestView(self, req.req_id, req.status, req.claimed_by, show_details=False)
         self.views[req.req_id] = view
         await message.edit(content=content, view=view)
 
@@ -333,7 +421,36 @@ class HelpQueueManager:
             return
         req.reason = clean_reason
         req.status = "open"
-        await self.update_message(req, "Open (details provided).")
+        lh_channel = self.client.get_channel(req.channel_id)
+        if isinstance(lh_channel, discord.TextChannel):
+            try:
+                lh_message = await lh_channel.fetch_message(req.message_id)
+                await lh_message.edit(content="Details submitted. Staff will respond in notifications.", view=None)
+            except discord.NotFound:
+                pass
+
+        if not self.channel:
+            await self.init_channel()
+        notify_channel = self.channel
+        if not notify_channel:
+            await interaction.response.send_message("Notifications channel not available.", ephemeral=True)
+            return
+
+        color_line = f"\nColor: {req.color}" if req.color else ""
+        reason_line = f"\nReason: {req.reason}" if req.reason else ""
+        content = (
+            f"Help requested by Lighthouse {req.lighthouse}.\n"
+            f"Request ID: `{req.req_id}`"
+            f"{color_line}"
+            f"{reason_line}\n"
+            "Status: Open (details provided)."
+        )
+        view = HelpRequestView(self, req.req_id, req.status, req.claimed_by, show_details=False)
+        notify_message = await notify_channel.send(content, view=view)
+        self.views[req.req_id] = view
+        req.message_id = notify_message.id
+        req.channel_id = notify_channel.id
+
         await interaction.response.send_message("Details added. Request is now in the queue.", ephemeral=True)
         event = f"HELP|DETAILS|{req.req_id}|{req.lighthouse}|{clean_reason}"
         await self.post_to_gateways(event)
@@ -622,6 +739,36 @@ async def send_announcement(
     await queue_manager.post_to_gateways(payload)
     await interaction.followup.send(f"Announcement queued in mailbox for {target_value}.", ephemeral=True)
 
+
+@command_tree.command(name="ping_lighthouses", description="Ping the mesh and report which lighthouses are online.")
+@app_commands.describe(timeout_seconds="How long to wait for responses (seconds)")
+async def ping_lighthouses(
+    interaction: discord.Interaction,
+    timeout_seconds: Optional[int] = 4,
+) -> None:
+    if not GATEWAY_URLS and not queue_manager.gateway_ip:
+        await interaction.response.send_message(
+            "Gateway not connected yet; try again after a lighthouse connects.",
+            ephemeral=True,
+        )
+        return
+    timeout = max(1, min(int(timeout_seconds or 4), 15))
+    ping_id = uuid.uuid4().hex[:8]
+    queue_manager.ping_waiters[ping_id] = set()
+    await interaction.response.send_message(
+        f"Pinging lighthouses (timeout {timeout}s)...",
+        ephemeral=True,
+    )
+    await queue_manager.post_to_gateways(f"HELP|PING|{ping_id}")
+    await asyncio.sleep(timeout)
+    online = sorted(queue_manager.ping_waiters.pop(ping_id, set()))
+    offline = [lh for lh in range(1, 31) if lh not in online]
+    online_text = ", ".join(f"{lh:02d}" for lh in online) if online else "none"
+    offline_text = ", ".join(f"{lh:02d}" for lh in offline) if offline else "none"
+    await interaction.followup.send(
+        f"Online: {online_text}\nOffline: {offline_text}",
+        ephemeral=True,
+    )
 
 
 

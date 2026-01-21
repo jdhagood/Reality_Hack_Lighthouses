@@ -66,6 +66,9 @@ void HelpGatewayServer::handleMeshPost() {
   if (!_server) {
     return;
   }
+#ifndef HELP_BOT_HTTP_PORT
+#define HELP_BOT_HTTP_PORT 8080
+#endif
   if (_token && _token[0] != '\0') {
     String header_token = _server->header("X-Help-Token");
     if (header_token.length() == 0 || header_token != _token) {
@@ -73,6 +76,14 @@ void HelpGatewayServer::handleMeshPost() {
                     header_token.length(), (unsigned int)strlen(_token));
       _server->send(401, "text/plain", "unauthorized");
       return;
+    }
+  }
+  if (_mesh) {
+    IPAddress remote_ip = _server->client().remoteIP();
+    if (remote_ip != INADDR_NONE) {
+      char url[96];
+      snprintf(url, sizeof(url), "http://%s:%d/mesh", remote_ip.toString().c_str(), HELP_BOT_HTTP_PORT);
+      _mesh->setHelpBotUrl(url);
     }
   }
   String body = _server->arg("plain");

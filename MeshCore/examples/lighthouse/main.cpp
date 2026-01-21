@@ -72,6 +72,7 @@ static unsigned long last_debounce_time = 0;
 static unsigned long press_start_ms = 0;
 static bool long_press_sent = false;
 static uint8_t help_sfx_stage = 0;
+static bool helpbot_hello_sent = false;
 
 void halt() {
   while (1) ;
@@ -209,6 +210,11 @@ void loop() {
     help_discovery.loop();
     if (!help_bot.isEnabled() && help_discovery.hasUrl()) {
       help_bot.setUrl(help_discovery.getUrl());
+    }
+    if (help_bot.isEnabled() && !helpbot_hello_sent) {
+      char hello[32];
+      snprintf(hello, sizeof(hello), "HELP|HELLO|LH%02d", LIGHTHOUSE_NUMBER);
+      helpbot_hello_sent = help_bot.postMeshEvent(hello, the_mesh.getNodeName());
     }
   }
 
