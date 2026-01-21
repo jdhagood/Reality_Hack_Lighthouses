@@ -1,2 +1,7 @@
 /Things Bought
 MeshCore/examples/lighthouse/secrets.h
+MeshCore/.pio/
+MeshCore/.pioenvs/
+MeshCore/.piolibdeps/
+MeshCore/.vscode/
+MeshCore/.idea/
