@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import os
 import socket
 import tempfile
+import time
 import uuid
 import wave
 from typing import Dict, Optional
@@ -124,6 +125,74 @@ def parse_help_message(text: str) -> Optional[Dict[str, str]]:
         data["timestamp"] = parts[4]
         return data
     return None
+
+
+@dataclass
+class LighthouseStatus:
+    lighthouse_id: str
+    ip: str
+    mac: str
+    firmware: str
+    uptime_s: int
+    last_seen: float
+    online: bool = True
+
+
+class LighthouseRegistry:
+    def __init__(self) -> None:
+        self.entries: Dict[str, LighthouseStatus] = {}
+        self.transport: Optional[asyncio.DatagramTransport] = None
+
+    def set_transport(self, transport: asyncio.DatagramTransport) -> None:
+        self.transport = transport
+
+    def update_from_packet(self, packet: str, addr) -> Optional[LighthouseStatus]:
+        parts = packet.strip().split("|")
+        if len(parts) < 6 or parts[0] != "LHREG":
+            return None
+        lighthouse_id = parts[1]
+        ip = parts[2]
+        mac = parts[3]
+        firmware = parts[4]
+        try:
+            uptime_s = int(parts[5])
+        except ValueError:
+            uptime_s = 0
+        now = time.time()
+        status = self.entries.get(lighthouse_id)
+        if status is None:
+            status = LighthouseStatus(
+                lighthouse_id=lighthouse_id,
+                ip=addr[0],
+                mac=mac,
+                firmware=firmware,
+                uptime_s=uptime_s,
+                last_seen=now,
+                online=True,
+            )
+            self.entries[lighthouse_id] = status
+        else:
+            status.ip = addr[0]
+            status.mac = mac
+            status.firmware = firmware
+            status.uptime_s = uptime_s
+            status.last_seen = now
+            status.online = True
+        return status
+
+    def mark_offline(self, offline_after_s: int) -> None:
+        now = time.time()
+        for status in self.entries.values():
+            status.online = (now - status.last_seen) <= offline_after_s
+
+    def send_to_lighthouse(self, lighthouse_id: str, payload: str, port: int) -> bool:
+        if not self.transport:
+            return False
+        status = self.entries.get(lighthouse_id)
+        if not status:
+            return False
+        self.transport.sendto(payload.encode("utf-8"), (status.ip, port))
+        return True
 
 
 class HelpRequestView(discord.ui.View):
@@ -521,6 +590,7 @@ audio_registry = AudioRegistry()
 tts_manager = TTSManager(TTS_MODEL_PATH, TTS_CONFIG_PATH, TTS_USE_CUDA)
 command_tree = app_commands.CommandTree(client)
 http_started = False
+lighthouse_registry = LighthouseRegistry()
 
 
 async def start_http_server() -> None:
@@ -577,6 +647,14 @@ async def start_http_server() -> None:
     )
     print(f"UDP discovery listening on 0.0.0.0:{DISCOVERY_PORT}")
 
+    registration_host = getattr(app_secrets, "REGISTRATION_HOST", "0.0.0.0")
+    registration_port = int(getattr(app_secrets, "REGISTRATION_PORT", 9010))
+    await loop.create_datagram_endpoint(
+        lambda: RegistrationProtocol(lighthouse_registry),
+        local_addr=(registration_host, registration_port),
+    )
+    print(f"UDP registration listening on {registration_host}:{registration_port}")
+
 
 class DiscoveryProtocol(asyncio.DatagramProtocol):
     def __init__(self, http_port: int, token: str) -> None:
@@ -619,6 +697,25 @@ class DiscoveryProtocol(asyncio.DatagramProtocol):
             return local_ip
         except Exception:
             return "127.0.0.1"
+
+
+class RegistrationProtocol(asyncio.DatagramProtocol):
+    def __init__(self, registry: LighthouseRegistry) -> None:
+        self.registry = registry
+
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        self.registry.set_transport(transport)  # type: ignore[arg-type]
+
+    def datagram_received(self, data: bytes, addr) -> None:
+        try:
+            packet = data.decode("utf-8", errors="ignore").strip()
+        except Exception:
+            return
+        status = self.registry.update_from_packet(packet, addr)
+        if status:
+            response = f"LHACK|{status.lighthouse_id}|{int(time.time())}"
+            if self.registry.transport:
+                self.registry.transport.sendto(response.encode("utf-8"), addr)
 
 
 @client.event

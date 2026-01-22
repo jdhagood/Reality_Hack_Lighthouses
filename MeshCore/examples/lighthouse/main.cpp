@@ -21,13 +21,12 @@
 #elif defined(ESP32)
   #include <LittleFS.h>
   #include <esp_partition.h>
-  #include <esp_wifi.h>
   #include <WiFi.h>
   #include <WiFiUdp.h>
 #endif
 
 #ifdef ESP32
-  #ifdef BLE_PIN_CODE
+  #if defined(BLE_PIN_CODE) && !defined(DISABLE_BLE)
     #include <helpers/esp32/SerialBLEInterface.h>
     SerialBLEInterface serial_interface;
   #else
@@ -140,9 +139,6 @@ void setup() {
   Serial.printf("WiFi: connecting to %s...\n", wifi_ssid);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
-  uint8_t base_mac[6];
-  esp_read_mac(base_mac, ESP_MAC_WIFI_STA);
-  esp_wifi_set_mac(WIFI_IF_STA, base_mac);
   WiFi.begin(wifi_ssid, wifi_pass, 0, NULL, true);
   unsigned long wifi_start = millis();
   while (WiFi.status() != WL_CONNECTED && (millis() - wifi_start) < 8000) {
@@ -166,13 +162,15 @@ void setup() {
 
   the_mesh.begin();
 
-#ifdef BLE_PIN_CODE
+#if defined(BLE_PIN_CODE) && !defined(DISABLE_BLE)
   char dev_name[32+16];
   sprintf(dev_name, "%s%d", BLE_NAME_PREFIX, LIGHTHOUSE_NUMBER);
   uint32_t ble_pin = (uint32_t)BLE_PIN_CODE;
+  Serial.println("Initializing BLE serial interface...");
   serial_interface.begin(dev_name, ble_pin);
   Serial.printf("BLE started: %s (PIN: %lu)\n", dev_name, (unsigned long)ble_pin);
 #else
+  Serial.println("Initializing UART serial interface...");
   serial_interface.begin(Serial);
   Serial.println("Serial interface started");
 #endif
@@ -261,9 +259,13 @@ void loop() {
 #ifdef ESP32
   if (WiFi.status() == WL_CONNECTED) {
     if (!registration_started) {
-      registration_udp.begin(0);
-      registration_started = true;
-      last_registration_ms = 0;
+      if (registration_udp.begin(REGISTRATION_LOCAL_PORT)) {
+        registration_started = true;
+        last_registration_ms = 0;
+        Serial.printf("Registrar: UDP bound on port %u\n", (unsigned int)REGISTRATION_LOCAL_PORT);
+      } else {
+        Serial.println("Registrar: UDP bind failed");
+      }
     }
     unsigned long now = millis();
     if (last_registration_ms == 0 || (now - last_registration_ms) >= REGISTRATION_HEARTBEAT_MS) {
