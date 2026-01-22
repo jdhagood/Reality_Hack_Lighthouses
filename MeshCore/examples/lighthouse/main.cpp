@@ -8,6 +8,7 @@
 #include "HelpBotClient.h"
 #include "HelpBotDiscovery.h"
 #include "HelpGatewayServer.h"
+#include "secrets.h"
 
 #ifndef LIGHTHOUSE_NUMBER
 #error "LIGHTHOUSE_NUMBER must be defined (1-30)"
@@ -20,7 +21,9 @@
 #elif defined(ESP32)
   #include <LittleFS.h>
   #include <esp_partition.h>
+  #include <esp_wifi.h>
   #include <WiFi.h>
+  #include <WiFiUdp.h>
 #endif
 
 #ifdef ESP32
@@ -73,6 +76,11 @@ static unsigned long press_start_ms = 0;
 static bool long_press_sent = false;
 static uint8_t help_sfx_stage = 0;
 static bool helpbot_hello_sent = false;
+#ifdef ESP32
+static WiFiUDP registration_udp;
+static unsigned long last_registration_ms = 0;
+static bool registration_started = false;
+#endif
 
 void halt() {
   while (1) ;
@@ -127,11 +135,15 @@ void setup() {
 #endif
 
 #ifdef ESP32
-  const char *wifi_ssid = "Tatertot";
-  const char *wifi_pass = "alohomora";
+  const char *wifi_ssid = WIFI_SSID;
+  const char *wifi_pass = WIFI_PASS;
   Serial.printf("WiFi: connecting to %s...\n", wifi_ssid);
   WiFi.mode(WIFI_STA);
-  WiFi.begin(wifi_ssid, wifi_pass);
+  WiFi.setSleep(false);
+  uint8_t base_mac[6];
+  esp_read_mac(base_mac, ESP_MAC_WIFI_STA);
+  esp_wifi_set_mac(WIFI_IF_STA, base_mac);
+  WiFi.begin(wifi_ssid, wifi_pass, 0, NULL, true);
   unsigned long wifi_start = millis();
   while (WiFi.status() != WL_CONNECTED && (millis() - wifi_start) < 8000) {
     light_ring.loop();
@@ -183,6 +195,34 @@ void setup() {
   the_mesh.setAudioStreamer(&audio_streamer);
 }
 
+#ifdef ESP32
+static void send_registration_packet(bool heartbeat) {
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+  IPAddress server_ip;
+  if (!server_ip.fromString(REGISTRATION_SERVER_IP)) {
+    return;
+  }
+  char lighthouse_id[8];
+  snprintf(lighthouse_id, sizeof(lighthouse_id), "LH-%02d", LIGHTHOUSE_NUMBER);
+  String ip = WiFi.localIP().toString();
+  String mac = WiFi.macAddress();
+  unsigned long uptime = millis() / 1000;
+  char payload[196];
+  snprintf(payload, sizeof(payload), "LHREG|%s|%s|%s|%s|%lu",
+           lighthouse_id,
+           ip.c_str(),
+           mac.c_str(),
+           FIRMWARE_VERSION,
+           uptime);
+  registration_udp.beginPacket(server_ip, REGISTRATION_SERVER_PORT);
+  registration_udp.write(reinterpret_cast<const uint8_t *>(payload), strlen(payload));
+  registration_udp.endPacket();
+  Serial.printf("Registrar: sent %s\n", heartbeat ? "heartbeat" : "registration");
+}
+#endif
+
 void loop() {
   the_mesh.loop();
   rtc_clock.tick();
@@ -217,6 +257,21 @@ void loop() {
       helpbot_hello_sent = help_bot.postMeshEvent(hello, the_mesh.getNodeName());
     }
   }
+
+#ifdef ESP32
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!registration_started) {
+      registration_udp.begin(0);
+      registration_started = true;
+      last_registration_ms = 0;
+    }
+    unsigned long now = millis();
+    if (last_registration_ms == 0 || (now - last_registration_ms) >= REGISTRATION_HEARTBEAT_MS) {
+      send_registration_packet(last_registration_ms != 0);
+      last_registration_ms = now;
+    }
+  }
+#endif
 
   // Button debouncing and detection
   int reading = digitalRead(PIN_USER_BTN);
